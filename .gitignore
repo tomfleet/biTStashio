@@ -1,6 +1,7 @@
 fs_parts/
 fs_parts/*
 output.mp4
+diff.sh
 files.txt
 ts_parts/00005.ts
 ts_parts/00006.ts

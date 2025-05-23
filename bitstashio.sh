@@ -1,9 +1,33 @@
 #!/bin/bash
 
 # --- Configuration ---
-OUTPUT_MP4="output.mp4"
 FILE_LIST="files.txt"
 DOWNLOAD_DIR="ts_parts" # Directory to save the downloaded .ts files
+OUTPUT_MP4="" # Will be set after parsing the URL
+M3U8_URL="" # Will be set if -m flag is used
+
+# --- Command line arguments ---
+while getopts "m:" opt; do
+    case $opt in
+        m)
+            M3U8_URL="$OPTARG"
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG"
+            exit 1
+            ;;
+    esac
+done
+
+# >>> NEW CONFIGURATION FOR PARSING SEGMENT NUMBER <<<
+# Define a regular expression to find the segment number in the URL.
+# The actual segment number MUST be inside a CAPTURE GROUP ()
+# Examples:
+# For URL like ..._1080_00001.ts    -> SEGMENT_REGEX='_1080_([0-9]+)\.ts$'
+# For URL like ..._00001.ts         -> SEGMENT_REGEX='_([0-9]+)\.ts$'
+# For URL like .../seg_00001.ts     -> SEGMENT_REGEX='seg_([0-9]+)\.ts$'
+# You MUST set this correctly based on your URL structure.
+SEGMENT_REGEX='_([0-9]+)\.ts$' # <--- ADJUST THIS REGEX IF YOUR URL IS DIFFERENT
 
 # --- Prompt for curl command ---
 echo "Please paste the complete curl command (including '\\' for line continuation) and press Enter when done."
@@ -58,12 +82,31 @@ echo "Extracted Headers Count: ${#HEADERS[@]}"
 echo "Extracted Cookies: ${COOKIES:0:50}..." # Show only first 50 chars of cookies
 
 
-# --- Parse URL to get Base URL and Starting Number ---
-# Use sed to remove the number and .ts extension at the end
-BASE_URL=$(echo "$MAIN_URL" | sed 's|_[0-9]\+\.ts$|_|')
+# --- Parse URL to get Base URL and Starting Number using SEGMENT_REGEX ---
+# Extract the segment number string using the defined regex capture group
+START_NUM_STR=$(echo "$MAIN_URL" | grep -oP "$SEGMENT_REGEX" | grep -oP '\d+')
 
-# Use sed to extract the number before .ts
-START_NUM_STR=$(echo "$MAIN_URL" | sed 's|^.*_\([0-9]\+\)\.ts$|\1|')
+if [ -z "$START_NUM_STR" ]; then
+    echo "Could not automatically detect segment number pattern."
+    echo "Please enter:"
+    echo "1. The base URL (everything before the changing number)"
+    echo "2. The starting number"
+    echo "3. The suffix (everything after the number)"
+    read -p "Base URL: " BASE_URL
+    read -p "Starting number: " START_NUM_STR
+    read -p "Suffix (e.g. -v1-a1.ts): " FILE_SUFFIX
+    
+    if [[ ! "$START_NUM_STR" =~ ^[0-9]+$ ]]; then
+        echo "Error: Starting number must be numeric"
+        exit 1
+    fi
+    
+    # Set output name based on the last part of the base URL
+    BASE_NAME=$(basename "$BASE_URL" | sed 's/_*$//')
+    OUTPUT_MP4="${BASE_NAME}.mp4"
+    
+    echo "Output will be saved as: $OUTPUT_MP4"
+fi
 
 # Determine the number of digits from the starting number string
 NUM_DIGITS=${#START_NUM_STR}
@@ -85,7 +128,7 @@ DOWNLOADED_FILES=() # Array to store paths of successfully downloaded files
 while true; do
     # Format the current number with leading zeros
     FORMATTED_NUM=$(printf "%0${NUM_DIGITS}d" $CURRENT_NUM)
-    FILE_URL="${BASE_URL}${FORMATTED_NUM}.ts"
+    FILE_URL="${BASE_URL}${FORMATTED_NUM}${FILE_SUFFIX}"
     OUTPUT_FILE="${DOWNLOAD_DIR}/${FORMATTED_NUM}.ts"
 
     echo "Checking: ${FILE_URL}"
@@ -163,3 +206,84 @@ fi
 # rm -rf "$DOWNLOAD_DIR" "$FILE_LIST"
 
 echo "Process complete (check for FFmpeg errors above)."
+
+fi # End of the if [ "$goto_ffmpeg" -eq 0 ] block
+
+# --- Handle M3U8 if provided ---
+if [ ! -z "$M3U8_URL" ]; then
+    echo "M3U8 URL provided. Attempting to parse playlist..."
+    
+    # Create a temporary file for the m3u8 content
+    M3U8_TEMP=$(mktemp)
+    
+    # Download the m3u8 file
+    if ! curl -s "$M3U8_URL" > "$M3U8_TEMP"; then
+        echo "Failed to download M3U8 playlist"
+        rm "$M3U8_TEMP"
+        exit 1
+    fi
+    
+    # Get the base URL for the ts files
+    M3U8_BASE_URL=$(dirname "$M3U8_URL")
+    
+    # Parse the m3u8 file for .ts files
+    TS_URLS=()
+    while IFS= read -r line; do
+        # Skip lines starting with # (comments/directives)
+        [[ $line =~ ^# ]] && continue
+        # Skip empty lines
+        [ -z "$line" ] && continue
+        
+        # If line ends with .ts, it's a segment
+        if [[ $line == *".ts" ]]; then
+            # Handle both absolute and relative URLs
+            if [[ $line == http* ]]; then
+                TS_URLS+=("$line")
+            else
+                TS_URLS+=("$M3U8_BASE_URL/$line")
+            fi
+        fi
+    done < "$M3U8_TEMP"
+    
+    # Clean up temp file
+    rm "$M3U8_TEMP"
+    
+    # Set the output name based on the m3u8 filename if not already set
+    if [ -z "$OUTPUT_MP4" ]; then
+        OUTPUT_MP4=$(basename "$M3U8_URL" .m3u8).mp4
+    fi
+    
+    echo "Found ${#TS_URLS[@]} segments in playlist"
+    echo "Output will be saved as: $OUTPUT_MP4"
+    
+    # Create download directory
+    mkdir -p "$DOWNLOAD_DIR"
+    
+    # Download the segments
+    DOWNLOADED_FILES=()
+    for ((i=0; i<${#TS_URLS[@]}; i++)); do
+        url="${TS_URLS[$i]}"
+        OUTPUT_FILE="${DOWNLOAD_DIR}/$(printf "%05d" $i).ts"
+        echo "Downloading segment $((i+1))/${#TS_URLS[@]}: $url"
+        
+        # Use curl with the same headers/cookies as main script
+        curl_download_cmd="curl -o \"$OUTPUT_FILE\" \"$url\""
+        for header in "${HEADERS[@]}"; do
+            curl_download_cmd+=" -H '$header'"
+        done
+        if [ -n "$COOKIES" ]; then
+            curl_download_cmd+=" -b '$COOKIES'"
+        fi
+        
+        eval "$curl_download_cmd"
+        
+        if [ $? -eq 0 ]; then
+            DOWNLOADED_FILES+=("$OUTPUT_FILE")
+        else
+            echo "Error downloading segment $((i+1))"
+            continue
+        fi
+    done
+    
+    # m3u8 processing complete
+fi
